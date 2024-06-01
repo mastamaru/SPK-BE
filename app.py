@@ -5,6 +5,7 @@ from pymongo.server_api import ServerApi
 import pandas as pd
 import os
 from sklearn.metrics.pairwise import cosine_similarity
+import hashlib
 
 mongo_uri = os.environ['MONGO_URI']
 
@@ -16,6 +17,19 @@ df_meta = pd.read_csv('db_processed.csv')
 
 app = Flask(__name__)
 CORS(app)
+
+
+def hash_password(password):
+    salt = os.urandom(16)  # Membuat salt acak
+    hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
+    return salt + hash_obj
+
+
+def verify_password(stored_password, provided_password):
+    salt = stored_password[:16]  # Ambil 16 byte pertama sebagai salt
+    stored_hash = stored_password[16:]
+    hash_obj = hashlib.pbkdf2_hmac('sha256', provided_password.encode(), salt, 100000)
+    return stored_hash == hash_obj
 
 
 def get_recommendations(title, cosine_sim, df_anime):
@@ -92,15 +106,17 @@ def get_anime():
 def register():
     # get data from request, with format json 'username' and 'password'
     data = request.get_json()
+    name = data['name']
     username = data['username']
     password = data['password']
 
     anime = data['anime']
 
     df_anime = df[df['name'] == anime]
-# check if user already registered
+    # check if user already registered
     if db.user_data.find_one({'username': username}):
         return jsonify({'message': 'User already registered'})
+
     df_anime['episodes'] = df_anime['episodes'].astype(int)
     df_anime['genre'] = df_anime['genre'].apply(lambda x: x.split(', '))
     for index, row in df_anime.iterrows():
@@ -130,16 +146,67 @@ def register():
 
     cosine_sim = cosine_similarity(user_rec, user_rec)
 
+    hashed_password = hash_password(password)
     recommendations = get_recommendations(anime, cosine_sim, user_rec)
     # testing recommendation
     # return jsonify({'message': f'here are the recommendation : {get_recommendations(anime, cosine_sim, user_rec)} for user {username}'})
 
-
     # insert user data and recommendations to database
     db.user_data.insert_one({
+        'name': name,
         'username': username,
-        'password': password,
+        'password': hashed_password,
         'recommendations': recommendations['Anime'].tolist()
     })
 
     return jsonify({'message': f"User {username} registered with recommendations: {recommendations}"})
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
+
+    user = db.user_data.find_one({'username': username})
+    if user and verify_password(user['password'], password):
+        return jsonify({'message': f"User {username} logged in with recommendations: {user['recommendations']}"})
+    else:
+        return jsonify({'message': 'Invalid username or password'})
+    
+    
+@app.route('/get_name', methods=['GET'])
+def get_name():
+    username = request.args.get('username')
+    user = db.user_data.find_one({'username': username})
+    if user:
+        return jsonify({'name': user['name']})
+    else:
+        return jsonify({'message': 'User not found'})
+
+
+@app.route('/fetch_anime', methods=['GET'])
+def fetch_anime():
+    username = request.args.get('username')
+    user = db.user_data.find_one({'username': username})
+    if user:
+        anime = user['recommendations']
+        results = []
+        for title in anime:
+            query = {"title": title}
+            for item in db.anime_meta.find(query):
+                results.append({
+                    "title": item['title'],
+                    "type": item.get('type', ''),
+                    "episodes": item.get('episodes', ''),
+                    "score": item.get('score', ''),
+                    "aired_from": item.get('aired_from', ''),
+                    "aired_to": item.get('aired_to', ''),
+                    "synopsis": item.get('synopsis', ''),
+                    "genre": item.get('genre', []),
+                    "poster": item.get('poster', ''),
+                    "streaming_link": item.get('streaming_link', '')
+                })
+        return jsonify(results)
+    else:
+        return jsonify({'message': 'User not found'})
