@@ -6,16 +6,24 @@ import pandas as pd
 import os
 from sklearn.metrics.pairwise import cosine_similarity
 import hashlib
+import jwt
+import datetime
+from functools import wraps
+
 
 mongo_uri = os.environ['MONGO_URI']
 
 client = MongoClient(mongo_uri, server_api=ServerApi('1'))
 db = client['SPK']
 df = pd.read_csv('./data/anime.csv')
+# df = df.loc[df['name'] != 'Mahouka Koukou no Rettousei', :]
+# df = df.loc[df['name'] != 'Naruto', :]
+df = df.loc[df['episodes'] != 'Unknown', :]
 
 df_meta = pd.read_csv('db_processed.csv')
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ['SECRET_KEY']
 CORS(app)
 
 
@@ -37,13 +45,18 @@ def get_recommendations(title, cosine_sim, df_anime):
     if title not in df_anime.index:
         return f"Anime dengan judul '{title}' tidak ditemukan."
 
+
     # Mendapatkan indeks dari anime yang dicari
     idx = df_anime.index.get_loc(title)
 
     # Mendapatkan skor similarity dari semua anime dengan anime yang dicari
     sim_scores = list(enumerate(cosine_sim[idx]))
 
-    # Mengurutkan anime berdasarkan similarity score
+    # mengubah jadi scalar
+    # sim_scores = [(i, score.item() if hasattr(score, 'item') else score) for i, score in sim_scores]
+
+
+# Mengurutkan anime berdasarkan similarity score
     sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
 
     # Mendapatkan 10 anime teratas yang paling mirip
@@ -137,12 +150,15 @@ def register():
     for t in df_anime['type'].unique():
         df_anime[t] = df_anime['type'].apply(lambda x: 1 if x == t else 0)
 
+    df_anime = df_anime.copy()
     df_anime.drop('type', axis=1, inplace=True)
     df_anime.drop(['genre'], axis=1, inplace=True)
 
     user_rec = pd.concat([df_meta, df_anime], axis=0)
     user_rec.fillna(0, inplace=True)
     user_rec.set_index('name', inplace=True)
+
+    user_rec = user_rec[~user_rec.index.duplicated(keep='first')]
 
     cosine_sim = cosine_similarity(user_rec, user_rec)
 
@@ -170,11 +186,15 @@ def login():
 
     user = db.user_data.find_one({'username': username})
     if user and verify_password(user['password'], password):
-        return jsonify({'message': f"User {username} logged in with recommendations: {user['recommendations']}"})
+        token = jwt.encode({
+            'username': username,
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+        }, app.config['SECRET_KEY'], algorithm='HS256')
+
+        return jsonify({'token': token})
     else:
-        return jsonify({'message': 'Invalid username or password'})
-    
-    
+        return jsonify({'message': 'Invalid username or password'}), 401
+
 @app.route('/get_name', methods=['GET'])
 def get_name():
     username = request.args.get('username')
@@ -210,3 +230,27 @@ def fetch_anime():
         return jsonify(results)
     else:
         return jsonify({'message': 'User not found'})
+
+# verif token
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'x-access-token' in request.headers:
+            token = request.headers['x-access-token']
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user = mongo.db.user_data.find_one({'username': data['username']})
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
+
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+@app.route('/protected', methods=['GET'])
+@token_required
+def protected(current_user):
+    return jsonify({'message': 'This is a protected route.', 'user': current_user['username']})
